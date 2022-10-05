@@ -29,7 +29,7 @@ def preprocess(data_name):
 
   raw_df = pd.read_csv(data_name)
   
-  raw_df['ts'] = raw_df['optimized_date'].apply(pd.to_datetime).astype(int) // 10**9 // (4*WEEK_IN_SECS)
+  raw_df['ts'] = raw_df['optimized_date'].apply(pd.to_datetime).astype(int) // 10**9 // (1*WEEK_IN_SECS)
   df = raw_df.groupby(['member_id','merchant_format_name', 'ts']).agg({'transaction_amount':'sum', 'category':'first', 'subcategory':'first', 'member_home_state':'first'}).reset_index()
   df = df.sort_values('ts')
   result_df = pd.DataFrame({'u': df['member_id'].astype('category').cat.codes.tolist(),
@@ -65,12 +65,12 @@ def reindex(df, bipartite=True):
   return new_df
 
 
-def run(data_name, bipartite=True):
+def run(data_name, agg, bipartite=True):
   Path("data/").mkdir(parents=True, exist_ok=True)
   PATH = '../data/{}.csv'.format(data_name)
-  OUT_DF = './processed/ml_{}.csv'.format(data_name)
-  OUT_FEAT = './processed/ml_{}.npy'.format(data_name)
-  OUT_NODE_FEAT = './processed/ml_{}_node.npy'.format(data_name)
+  OUT_DF = './processed/ml_{}_{}.csv'.format(data_name, agg)
+  OUT_FEAT = './processed/ml_{}_{}.npy'.format(data_name, agg)
+  OUT_NODE_FEAT = './processed/ml_{}_{}_node.npy'.format(data_name, agg)
 
   df = preprocess(PATH)
   new_df = reindex(df, bipartite)
@@ -101,8 +101,10 @@ def run(data_name, bipartite=True):
 parser = argparse.ArgumentParser('Interface for TGN data preprocessing')
 parser.add_argument('--data', type=str, help='Dataset name (eg. wikipedia or reddit)',
                     default='u2k_i200')
+parser.add_argument('--agg', type=str, help='Dataset name (eg. wikipedia or reddit)',
+                    default='1W')
 parser.add_argument('--bipartite', action='store_true', help='Whether the graph is bipartite')
 
 args = parser.parse_args()
 
-run(args.data)
+run(args.data, args.agg)

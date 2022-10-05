@@ -22,7 +22,7 @@ from utils import EarlyStopMonitor, RandEdgeSampler
 
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for TGAT experiments on link predictions')
-parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='u2k_i200')
+parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='u2k_i200_1W')
 parser.add_argument('--bs', type=int, default=200, help='batch_size')
 parser.add_argument('--prefix', type=str, default='', help='prefix to name the checkpoints')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')

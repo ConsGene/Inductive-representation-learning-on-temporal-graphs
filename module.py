@@ -12,7 +12,7 @@ class MergeLayer(torch.nn.Module):
         #self.layer_norm = torch.nn.LayerNorm(dim1 + dim2)
         self.fc1 = torch.nn.Linear(dim1 + dim2, dim3)
         self.fc2 = torch.nn.Linear(dim3, dim4)
-        self.act = torch.nn.ReLU()
+        self.act = torch.nn.LeakyReLU(negative_slope=0.2)
 
         torch.nn.init.xavier_normal_(self.fc1.weight)
         torch.nn.init.xavier_normal_(self.fc2.weight)
@@ -402,6 +402,7 @@ class TGAN(torch.nn.Module):
         self.model_dim = self.feat_dim
         
         self.use_time = use_time
+        self.leaky_relu = nn.LeakyReLU()
         self.merge_layer = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, self.feat_dim)
         
         if agg_method == 'attn':
@@ -450,14 +451,15 @@ class TGAN(torch.nn.Module):
         score = self.affinity_score(src_embed, target_embed).squeeze(dim=-1)
         
         return score
-
+    # change the activation function here when the label range is changed
     def contrast(self, src_idx_l, target_idx_l, background_idx_l, cut_time_l, num_neighbors=20):
         src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
         target_embed = self.tem_conv(target_idx_l, cut_time_l, self.num_layers, num_neighbors)
         background_embed = self.tem_conv(background_idx_l, cut_time_l, self.num_layers, num_neighbors)
         pos_score = self.affinity_score(src_embed, target_embed).squeeze(dim=-1)
         neg_score = self.affinity_score(src_embed, background_embed).squeeze(dim=-1)
-        return pos_score.sigmoid(), neg_score.sigmoid()
+        # return pos_score.tanh(), neg_score.tanh()
+        return pos_score, neg_score # the activation of affinity_score is already LeakyReLU
 
     def tem_conv(self, src_idx_l, cut_time_l, curr_layers, num_neighbors=20):
         assert(curr_layers >= 0)

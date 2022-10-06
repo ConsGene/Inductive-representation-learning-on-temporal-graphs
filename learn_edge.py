@@ -25,6 +25,7 @@ parser = argparse.ArgumentParser('Interface for TGAT experiments on link predict
 parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='u2k_i200_1W')
 parser.add_argument('--bs', type=int, default=200, help='batch_size')
 parser.add_argument('--prefix', type=str, default='', help='prefix to name the checkpoints')
+parser.add_argument('--loss', type=str, choices=['l1', 'l2'], default='l1', help='type of loss')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
 parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
 parser.add_argument('--n_epoch', type=int, default=50, help='number of epochs')
@@ -320,7 +321,10 @@ tgan = TGAN(train_ngh_finder, n_feat, e_feat,
             num_layers=NUM_LAYER, use_time=USE_TIME, agg_method=AGG_METHOD, attn_mode=ATTN_MODE,
             seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM)
 optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
-criterion = torch.nn.MSELoss()
+if args.loss == 'l1':
+    criterion = torch.nn.L1Loss()
+else:
+    criterion = torch.nn.MSELoss()
 tgan = tgan.to(device)
 
 num_instance = len(train_src_l)
@@ -362,8 +366,7 @@ for epoch in range(NUM_EPOCH):
         pos_pred, neg_pred = tgan.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
 
         # if args.scale_label == 'none':
-        loss = criterion(pos_pred, pos_label)
-        loss += criterion(neg_pred, neg_label)
+        loss = criterion(torch.concat([pos_pred, neg_pred]), torch.concat([pos_label, neg_label]))
         # else:
         #     pos_pred_raw, pos_label_raw = convert_to_raw_label_scale(dst_l_cut, pos_pred, pos_label)
         #     neg_pred_raw, neg_label_raw = convert_to_raw_label_scale(dst_l_fake, neg_pred, neg_label)

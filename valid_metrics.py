@@ -67,6 +67,7 @@ TIME_DIM = args.time_dim
 
 
 MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}.pth'
+OUTPUT_SAVE_PATH = f'./saved_models/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}.csv'
 get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}-{epoch}.pth'
 
 ### set up logger
@@ -88,6 +89,7 @@ logger.info(args)
 
 def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label, label_raw):
     val_mae_raw, val_mae, val_r2_raw, val_r2 = [], [], [], []
+    all_src, all_dst, all_dst_fk, all_pred_pos, all_pred_neg, all_true_pos, all_true_neg, all_ts = [], [], [], [], [], [], [], []
     with torch.no_grad():
         tgan = tgan.eval()
         TEST_BATCH_SIZE=30
@@ -110,7 +112,7 @@ def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label, label_raw):
             pos_label_raw = label_raw[s_idx:e_idx]
             neg_label = np.zeros(size)
             pos_pred, neg_pred = tgan.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
-            
+
             pred_score = np.concatenate([(pos_pred).cpu().numpy(), (neg_pred).cpu().numpy()])
             # pred_label = pred_score > 0.5
             true_label = np.concatenate([pos_label, neg_label])
@@ -121,8 +123,20 @@ def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label, label_raw):
                 pred_score_raw = convert_to_raw_label_scale(np.concatenate([dst_l_cut,dst_l_fake]), pred_score)
                 val_r2_raw.append(r2_score(true_label_raw, pred_score_raw))
                 val_mae_raw.append(mean_absolute_error(true_label_raw, pred_score_raw))
-
-    return np.mean(val_mae_raw), np.mean(val_mae), np.mean(val_r2_raw), np.mean(val_r2)
+                all_pred_pos.extend(pred_score_raw[:size])
+                all_pred_neg.extend(pred_score_raw[size:])
+            else:
+                all_pred_pos.extend(pred_score[:size])
+                all_pred_neg.extend(pred_score[size:])
+            
+            all_src.extend(src_l_cut)
+            all_dst.extend(dst_l_cut)
+            all_ts.extend(ts_l_cut)
+            all_dst_fk.extend(dst_l_fake)
+            all_true_pos.extend(pos_label_raw)
+            all_true_neg.extend(neg_label)
+    result_df = pd.DataFrame({'ts':all_ts, 'src': all_src, 'dst': all_dst, 'dst_neg': all_dst_fk, 'pos_label': all_true_pos, 'neg_label':all_true_neg, 'pos_pred': all_pred_pos, 'neg_pred': all_pred_neg})
+    return np.mean(val_mae_raw), np.mean(val_mae), np.mean(val_r2_raw), np.mean(val_r2), result_df
 
 ### Load data and train val test split
 g_df = pd.read_csv('./processed/ml_{}.csv'.format(DATA))
@@ -255,19 +269,6 @@ new_node_set = total_node_set - train_node_set
 valid_val_flag = (ts_l <= test_time) * (ts_l > val_time)
 valid_test_flag = ts_l > test_time
 
-# is_new_node_edge = np.array([(a in new_node_set or b in new_node_set) for a, b in zip(src_l, dst_l)])
-# nn_val_flag = valid_val_flag * is_new_node_edge
-# nn_test_flag = valid_test_flag * is_new_node_edge
-
-# validation and test with all edges
-val_src_l = src_l[valid_val_flag]
-val_dst_l = dst_l[valid_val_flag]
-val_ts_l = ts_l[valid_val_flag]
-val_e_idx_l = e_idx_l[valid_val_flag]
-val_label_l = label_l[valid_val_flag]
-val_raw_label_l = raw_label_l[valid_val_flag]
-val_cat_l = cat_l[valid_val_flag]
-
 test_src_l = src_l[valid_test_flag]
 test_dst_l = dst_l[valid_test_flag]
 test_ts_l = ts_l[valid_test_flag]
@@ -335,114 +336,19 @@ logger.info('num of batches per epoch: {}'.format(num_batch))
 idx_list = np.arange(num_instance)
 np.random.shuffle(idx_list) 
 
-early_stopper = EarlyStopMonitor(higher_better=False)
-for epoch in range(NUM_EPOCH):
-    # Training 
-    # training use only training graph
-    tgan.ngh_finder = train_ngh_finder
-    mae_raw, mae, r2_raw, r2, m_loss = [], [], [], [], []
-    np.random.shuffle(idx_list)
-    logger.info('start {} epoch'.format(epoch))
-    for k in tqdm(range(num_batch)):
-        # percent = 100 * k / num_batch
-        # if k % int(0.2 * num_batch) == 0:
-        #     logger.info('progress: {0:10.4f}'.format(percent))
-
-        s_idx = k * BATCH_SIZE
-        e_idx = min(num_instance - 1, s_idx + BATCH_SIZE)
-        src_l_cut, dst_l_cut = train_src_l[s_idx:e_idx], train_dst_l[s_idx:e_idx]
-        ts_l_cut = train_ts_l[s_idx:e_idx]
-        label_l_cut = train_label_l[s_idx:e_idx]
-        raw_label_l_cut = train_raw_label_l[s_idx:e_idx]
-        size = len(src_l_cut)
-        _, dst_l_fake = train_rand_sampler.sample(size)
-        
-        with torch.no_grad():
-            pos_label = torch.tensor(label_l_cut, dtype=torch.float, device=device)
-            neg_label = torch.zeros(size, dtype=torch.float, device=device)
-        
-        optimizer.zero_grad()
-        tgan = tgan.train()
-        pos_pred, neg_pred = tgan.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
-
-        # if args.scale_label == 'none':
-        loss = criterion(torch.concat([pos_pred, neg_pred]), torch.concat([pos_label, neg_label]))
-        # else:
-        #     pos_pred_raw, pos_label_raw = convert_to_raw_label_scale(dst_l_cut, pos_pred, pos_label)
-        #     neg_pred_raw, neg_label_raw = convert_to_raw_label_scale(dst_l_fake, neg_pred, neg_label)
-        #     loss = criterion(pos_pred_raw, pos_label_raw)
-        #     loss += criterion(neg_pred_raw, neg_label_raw)
-        
-        loss.backward()
-        optimizer.step()
-        # get training results
-        with torch.no_grad():
-            tgan = tgan.eval()
-            pred_score = np.concatenate([(pos_pred).cpu().detach().numpy(), (neg_pred).cpu().detach().numpy()])
-            true_label = np.concatenate([label_l_cut, np.zeros(size)])
-            true_label_raw = np.concatenate([raw_label_l_cut, np.zeros(size)])
-            
-            mae.append(mean_absolute_error(true_label, pred_score))
-
-            # f1.append(f1_score(true_label, pred_label))
-            m_loss.append(loss.item())
-            r2.append(r2_score(true_label, pred_score))
-            if args.scale_label != 'none':
-                pred_score_raw = convert_to_raw_label_scale(np.concatenate([dst_l_cut,dst_l_fake]), pred_score)
-                mae_raw.append(mean_absolute_error(true_label_raw, pred_score_raw))
-                r2_raw.append(r2_score(true_label_raw, pred_score_raw))
-
-    # validation phase use all information
-    tgan.ngh_finder = full_ngh_finder
-    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch('val for old nodes', tgan, val_rand_sampler, val_src_l, 
-    val_dst_l, val_ts_l, val_label_l, val_raw_label_l)
-
-    # nn_val_acc, nn_val_ap, nn_val_f1, nn_val_auc = eval_one_epoch('val for new nodes', tgan, val_rand_sampler, nn_val_src_l, 
-    # nn_val_dst_l, nn_val_ts_l, nn_val_label_l)
-        
-    logger.info('epoch: {}:'.format(epoch))
-    logger.info('Epoch mean loss: {:.4f}'.format(np.mean(m_loss)))
-    # logger.info('train acc: {}, val acc: {}, new node val acc: {}'.format(np.mean(acc), val_acc, nn_val_acc))
-    # logger.info('train R2: {}, val R2: {}, new node val R2: {}'.format(np.mean(r2), val_auc, nn_val_auc))
-    # logger.info('train MAE: {}, val ap: {}, new node val MAE: {}'.format(np.mean(mae), val_ap, nn_val_ap))
-    # logger.info('train f1: {}, val f1: {}, new node val f1: {}'.format(np.mean(f1), val_f1, nn_val_f1))
-
-    logger.info('train R2: {:.4f}, val R2: {:.4f}'.format(np.mean(r2), val_r2))
-    logger.info('train MAE: {:.4f}, val MAE: {:.4f}'.format(np.mean(mae), val_mae))
-    if args.scale_label != 'none':
-        logger.info('train raw R2: {:.4f}, val raw R2: {:.4f}'.format(np.mean(r2_raw), val_r2_raw))
-        logger.info('train raw MAE: {:.4f}, val raw MAE: {:.4f}'.format(np.mean(mae_raw), val_mae_raw))
-
-    if early_stopper.early_stop_check(val_mae):
-        logger.info('No improvment over {} epochs, stop training'.format(early_stopper.max_round))
-        logger.info(f'Loading the best model at epoch {early_stopper.best_epoch}')
-        best_model_path = get_checkpoint_path(early_stopper.best_epoch)
-        tgan.load_state_dict(torch.load(best_model_path))
-        logger.info(f'Loaded the best model at epoch {early_stopper.best_epoch} for inference')
-        tgan.eval()
-        break
-    else:
-        torch.save(tgan.state_dict(), get_checkpoint_path(epoch))
-
 
 # testing phase use all information
+tgan.load_state_dict(torch.load(MODEL_SAVE_PATH))
 tgan.ngh_finder = full_ngh_finder
-test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch('test for old nodes', tgan, test_rand_sampler, test_src_l, 
+test_mae_raw, test_mae, test_r2_raw, test_r2, test_result = eval_one_epoch('test for old nodes', tgan, test_rand_sampler, test_src_l, 
 test_dst_l, test_ts_l, test_label_l, test_raw_label_l)
 
-# nn_test_acc, nn_test_ap, nn_test_f1, nn_test_auc = etestone_epoch('test for new nodes', tgan, nn_test_rand_sampler, nn_test_src_l, 
+test_result.to_csv(OUTPUT_SAVE_PATH)
+# nn_test_acc, nn_test_ap, nn_test_f1, nn_test_auc = eval_one_epoch('test for new nodes', tgan, nn_test_rand_sampler, nn_test_src_l, 
 # nn_test_dst_l, nn_test_ts_l, nn_test_label_l)
 
-logger.info('Test MAE: {:.4f}'.format(test_mae))
-if args.scale_label != 'none':
-    logger.info('Test raw R2: {:.4f}'.format(test_r2_raw))
-    logger.info('Test raw MAE: {:.4f}'.format(test_mae_raw))
+logger.info('Test statistics: Old nodes -- mae_raw: {}, mae: {}, r2_raw: {}, r2: {}'.format(test_mae_raw, test_mae, test_r2_raw, test_r2))
 # logger.info('Test statistics: New nodes -- acc: {}, auc: {}, ap: {}'.format(nn_test_acc, nn_test_auc, nn_test_ap))
-
-logger.info('Saving TGAN model')
-torch.save(tgan.state_dict(), MODEL_SAVE_PATH)
-logger.info('TGAN models saved')
-
  
 
 

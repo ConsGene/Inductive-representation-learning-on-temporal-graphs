@@ -15,6 +15,7 @@ from tqdm import tqdm
 from sklearn.metrics import r2_score
 from sklearn.metrics import mean_absolute_error
 from sklearn import preprocessing
+from data_utils import get_data
 
 from module import TGAN
 from graph import NeighborFinder
@@ -64,6 +65,7 @@ NUM_LAYER = args.n_layer
 LEARNING_RATE = args.lr
 NODE_DIM = args.node_dim
 TIME_DIM = args.time_dim
+SCALE = args.scale_label
 
 
 MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}.pth'
@@ -84,7 +86,11 @@ logger.addHandler(fh)
 logger.addHandler(ch)
 logger.info(args)
 
-
+if GPU >= 0:
+    device = torch.device('cuda:{}'.format(GPU))
+else:
+    device = torch.device('cpu')
+node_features, edge_features, full_data, train_data, val_data, test_data, scaleUtil = get_data(DATA, SCALE, device)
 
 def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label, label_raw):
     val_mae_raw, val_mae, val_r2_raw, val_r2 = [], [], [], []
@@ -118,206 +124,39 @@ def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label, label_raw):
             val_mae.append(mean_absolute_error(true_label, pred_score))
             val_r2.append(r2_score(true_label, pred_score))
             if args.scale_label != 'none':
-                pred_score_raw = convert_to_raw_label_scale(np.concatenate([dst_l_cut,dst_l_fake]), pred_score)
+                pred_score_raw = scaleUtil.convert_to_raw_label_scale(np.concatenate([dst_l_cut,dst_l_fake]), pred_score)
                 val_r2_raw.append(r2_score(true_label_raw, pred_score_raw))
                 val_mae_raw.append(mean_absolute_error(true_label_raw, pred_score_raw))
 
     return np.mean(val_mae_raw), np.mean(val_mae), np.mean(val_r2_raw), np.mean(val_r2)
 
-### Load data and train val test split
-g_df = pd.read_csv('./processed/ml_{}.csv'.format(DATA))
-# g_df_raw = g_df.copy()
-e_feat = np.load('./processed/ml_{}.npy'.format(DATA))
-n_feat = np.load('./processed/ml_{}_node.npy'.format(DATA))
-
-# e_feat = np.zeros((len(e_feat), 2))
-# n_feat = np.zeros((len(n_feat), 2))
-
-val_time, test_time = list(np.quantile(g_df.ts, [0.70, 0.85]))
-
-ts_l = g_df.ts.values
-valid_train_flag = (ts_l <= val_time)
-
-
-train_df = g_df[valid_train_flag]
-train_i = train_df.i.unique()
-# filter out new merchants in the valid/test
-from scipy import stats
-
-g_df = g_df[g_df.i.isin(train_i)]
-
-ts_l = g_df.ts.values
-valid_train_flag = (ts_l <= val_time)
-src_l = g_df.u.values
-dst_l = g_df.i.values
-cat_l = g_df.cat.values
-e_idx_l = g_df.idx.values
-
-max_src_index = src_l.max()
-max_idx = max(src_l.max(), dst_l.max())
-
-random.seed(2020)
-
-total_node_set = set(np.unique(np.hstack([g_df.u.values, g_df.i.values])))
-num_total_unique_nodes = len(total_node_set)
-
-# scaling labels
-g_df['raw_label'] = g_df.label.copy()
-raw_label_l = g_df.raw_label.values
-# NOTE!!!!!!! change TGAN.contrast if the label range is changed
-i2cat = g_df.groupby('i').first().reset_index().set_index('i')['cat'].to_dict()
-for cat in i2cat.values():
-    orig_labels = g_df.loc[(g_df.cat == cat) & valid_train_flag, 'label'].values
-    lower = np.quantile(orig_labels, 0.001)
-    upper = np.quantile(orig_labels, 0.999)
-    g_df.loc[(g_df.cat == cat) & valid_train_flag, 'label'] = np.clip(orig_labels, lower, upper)
-if args.scale_label == 'none':
-    label_l = g_df.label.values
-else:
-    # train_df['abs_label'] = train_df['label'].abs()
-    
-    # i_maxes = train_df.groupby('i')['abs_label'].max().reset_index().set_index('i')['abs_label'].to_dict()
-    # # normalize labels with the max value from training set
-    # for i, max_label in i_maxes.items():
-    #     g_df.loc[g_df.i == i, 'label'] /= max_label
-    # label_l = g_df.label.values
-    # def convert_to_raw_label_scale(dst_l_cut, preds):
-    #     if isinstance(preds, np.ndarray):
-    #         scale = np.array([i_maxes[dst] for dst in dst_l_cut])
-    #     else:
-    #         scale = torch.tensor([i_maxes[dst] for dst in dst_l_cut], dtype=float, device=device)
-    #     return preds * scale, labels * scale
-    train_df = g_df[valid_train_flag]
-    if args.scale_label == 'MinMax':
-        scaler = preprocessing.MinMaxScaler
-    elif args.scale_label == 'Quantile':
-        scaler = preprocessing.QuantileTransformer
-    elif args.scale_label == 'Log':
-        scaler = preprocessing.StandardScaler
-    elif args.scale_label == 'Cbrt':
-        scaler = preprocessing.StandardScaler
-    
-    def init_transform(label_vals):
-        if args.scale_label == 'Log':
-            label_vals = np.sign(label_vals) * np.log(np.abs(label_vals)+1)
-        elif args.scale_label == 'Cbrt':
-            label_vals = np.cbrt(label_vals)
-        return label_vals
-
-    scalers = {}
-    if args.scale_label == 'Cbrt':
-        g_df.label = np.cbrt(g_df.label.values)
-    else:
-        for cat in i2cat.values():
-            cat_train_df = train_df[train_df.cat==cat]
-            scalers[cat] = scaler()
-            train_label_vals = init_transform(cat_train_df.label.values)
-            scalers[cat].fit(train_label_vals.reshape(-1, 1))
-            label_vals = init_transform(g_df.loc[g_df.cat == cat]['label'].values)        
-            g_df.loc[g_df.cat == cat, 'label'] = scalers[cat].transform(label_vals.reshape(-1, 1))
-    
-    def convert_to_raw_label_scale(dst_l_cut, preds):
-        raw_preds = []
-        for dst, pred in zip(dst_l_cut, preds):
-            cat = i2cat[dst]
-            if args.scale_label == 'Cbrt':
-                raw = np.power(pred, 3)
-                raw_preds.append(raw)
-            else:
-                raw = scalers[cat].inverse_transform(pred.reshape(1, -1))
-                if args.scale_label == 'Log':
-                    raw = np.sign(raw) * (np.exp(np.abs(raw))-1)
-                elif args.scale_label == 'Cbrt':
-                    raw = np.power(raw, 3)
-                raw_preds.append(raw[0, 0])
-        if isinstance(preds, np.ndarray):
-            return np.array(raw_preds)
-        else:
-            return torch.tensor(raw_preds, dtype=float, device=device)
-    label_l = g_df.label.values
-
-
-
-train_src_l = src_l[valid_train_flag]
-train_dst_l = dst_l[valid_train_flag]
-train_ts_l = ts_l[valid_train_flag]
-train_e_idx_l = e_idx_l[valid_train_flag]
-train_label_l = label_l[valid_train_flag]
-train_raw_label_l = raw_label_l[valid_train_flag]
-train_cat_l = cat_l[valid_train_flag]
-
-# define the new nodes sets for testing inductiveness of the model
-train_node_set = set(train_src_l).union(train_dst_l)
-# assert(len(train_node_set - mask_node_set) == len(train_node_set))
-new_node_set = total_node_set - train_node_set
-
-# select validation and test dataset
-valid_val_flag = (ts_l <= test_time) * (ts_l > val_time)
-valid_test_flag = ts_l > test_time
-
-# is_new_node_edge = np.array([(a in new_node_set or b in new_node_set) for a, b in zip(src_l, dst_l)])
-# nn_val_flag = valid_val_flag * is_new_node_edge
-# nn_test_flag = valid_test_flag * is_new_node_edge
-
-# validation and test with all edges
-val_src_l = src_l[valid_val_flag]
-val_dst_l = dst_l[valid_val_flag]
-val_ts_l = ts_l[valid_val_flag]
-val_e_idx_l = e_idx_l[valid_val_flag]
-val_label_l = label_l[valid_val_flag]
-val_raw_label_l = raw_label_l[valid_val_flag]
-val_cat_l = cat_l[valid_val_flag]
-
-test_src_l = src_l[valid_test_flag]
-test_dst_l = dst_l[valid_test_flag]
-test_ts_l = ts_l[valid_test_flag]
-test_e_idx_l = e_idx_l[valid_test_flag]
-test_label_l = label_l[valid_test_flag]
-test_raw_label_l = raw_label_l[valid_test_flag]
-test_cat_l = cat_l[valid_test_flag]
-
-# # validation and test with edges that at least has one new node (not in training set)
-# nn_val_src_l = src_l[nn_val_flag]
-# nn_val_dst_l = dst_l[nn_val_flag]
-# nn_val_ts_l = ts_l[nn_val_flag]
-# nn_val_e_idx_l = e_idx_l[nn_val_flag]
-# nn_val_label_l = label_l[nn_val_flag]
-
-# nn_test_src_l = src_l[nn_test_flag]
-# nn_test_dst_l = dst_l[nn_test_flag]
-# nn_test_ts_l = ts_l[nn_test_flag]
-# nn_test_e_idx_l = e_idx_l[nn_test_flag]
-# nn_test_label_l = label_l[nn_test_flag]
-
+max_src_index = full_data.sources.max()
+max_idx = max(full_data.sources.max(), full_data.destinations.max())
 ### Initialize the data structure for graph and edge sampling
 # build the graph for fast query
 # graph only contains the training data (with 10% nodes removal)
 adj_list = [[] for _ in range(max_idx + 1)]
-for src, dst, eidx, ts in zip(train_src_l, train_dst_l, train_e_idx_l, train_ts_l):
+for src, dst, eidx, ts in zip(train_data.sources, train_data.destinations, train_data.edge_idxs, train_data.timestamps):
     adj_list[src].append((dst, eidx, ts))
     adj_list[dst].append((src, eidx, ts))
 train_ngh_finder = NeighborFinder(adj_list, uniform=UNIFORM)
 
 # full graph with all the data for the test and validation purpose
 full_adj_list = [[] for _ in range(max_idx + 1)]
-for src, dst, eidx, ts in zip(src_l, dst_l, e_idx_l, ts_l):
+for src, dst, eidx, ts in zip(full_data.sources, full_data.destinations, full_data.edge_idxs, full_data.timestamps):
     full_adj_list[src].append((dst, eidx, ts))
     full_adj_list[dst].append((src, eidx, ts))
 full_ngh_finder = NeighborFinder(full_adj_list, uniform=UNIFORM)
 
-train_rand_sampler = RandEdgeSampler(train_src_l, train_dst_l)
-val_rand_sampler = RandEdgeSampler(src_l, dst_l)
-# nn_val_rand_sampler = RandEdgeSampler(nn_val_src_l, nn_val_dst_l)
-test_rand_sampler = RandEdgeSampler(src_l, dst_l)
-# nn_test_rand_sampler = RandEdgeSampler(nn_test_src_l, nn_test_dst_l)
+train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations)
+val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations)
+# nn_val_rand_sampler = RandEdgeSampler(nn_val_data.sources, nn_val_data.destinations)
+test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations)
+# nn_test_rand_sampler = RandEdgeSampler(nn_test_src_l, nn_test_data.destinations)
 
 
 ### Model initialize
-if GPU >= 0:
-    device = torch.device('cuda:{}'.format(GPU))
-else:
-    device = torch.device('cpu')
-tgan = TGAN(train_ngh_finder, n_feat, e_feat,
+tgan = TGAN(train_ngh_finder, node_features, edge_features,
             num_layers=NUM_LAYER, use_time=USE_TIME, agg_method=AGG_METHOD, attn_mode=ATTN_MODE,
             seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM)
 optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
@@ -327,7 +166,7 @@ else:
     criterion = torch.nn.MSELoss()
 tgan = tgan.to(device)
 
-num_instance = len(train_src_l)
+num_instance = len(train_data.sources)
 num_batch = math.ceil(num_instance / BATCH_SIZE)
 
 logger.info('num of training instances: {}'.format(num_instance))
@@ -350,10 +189,10 @@ for epoch in range(NUM_EPOCH):
 
         s_idx = k * BATCH_SIZE
         e_idx = min(num_instance - 1, s_idx + BATCH_SIZE)
-        src_l_cut, dst_l_cut = train_src_l[s_idx:e_idx], train_dst_l[s_idx:e_idx]
-        ts_l_cut = train_ts_l[s_idx:e_idx]
-        label_l_cut = train_label_l[s_idx:e_idx]
-        raw_label_l_cut = train_raw_label_l[s_idx:e_idx]
+        src_l_cut, dst_l_cut = train_data.sources[s_idx:e_idx], train_data.destinations[s_idx:e_idx]
+        ts_l_cut = train_data.timestamps[s_idx:e_idx]
+        label_l_cut = train_data.labels[s_idx:e_idx]
+        raw_label_l_cut = train_data.raw_labels[s_idx:e_idx]
         size = len(src_l_cut)
         _, dst_l_fake = train_rand_sampler.sample(size)
         
@@ -388,17 +227,15 @@ for epoch in range(NUM_EPOCH):
             m_loss.append(loss.item())
             r2.append(r2_score(true_label, pred_score))
             if args.scale_label != 'none':
-                pred_score_raw = convert_to_raw_label_scale(np.concatenate([dst_l_cut,dst_l_fake]), pred_score)
+                pred_score_raw = scaleUtil.convert_to_raw_label_scale(np.concatenate([dst_l_cut,dst_l_fake]), pred_score)
                 mae_raw.append(mean_absolute_error(true_label_raw, pred_score_raw))
                 r2_raw.append(r2_score(true_label_raw, pred_score_raw))
 
     # validation phase use all information
     tgan.ngh_finder = full_ngh_finder
-    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch('val for old nodes', tgan, val_rand_sampler, val_src_l, 
-    val_dst_l, val_ts_l, val_label_l, val_raw_label_l)
+    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch('val for old nodes', tgan, val_rand_sampler, val_data.sources, 
+    val_data.destinations, val_data.timestamps, val_data.labels, val_data.raw_labels)
 
-    # nn_val_acc, nn_val_ap, nn_val_f1, nn_val_auc = eval_one_epoch('val for new nodes', tgan, val_rand_sampler, nn_val_src_l, 
-    # nn_val_dst_l, nn_val_ts_l, nn_val_label_l)
         
     logger.info('epoch: {}:'.format(epoch))
     logger.info('Epoch mean loss: {:.4f}'.format(np.mean(m_loss)))
@@ -427,11 +264,11 @@ for epoch in range(NUM_EPOCH):
 
 # testing phase use all information
 tgan.ngh_finder = full_ngh_finder
-test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch('test for old nodes', tgan, test_rand_sampler, test_src_l, 
-test_dst_l, test_ts_l, test_label_l, test_raw_label_l)
+test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch('test for old nodes', tgan, test_rand_sampler, test_data.sources, 
+test_data.destinations, test_data.timestamps, test_data.labels, test_data.raw_labels)
 
 # nn_test_acc, nn_test_ap, nn_test_f1, nn_test_auc = etestone_epoch('test for new nodes', tgan, nn_test_rand_sampler, nn_test_src_l, 
-# nn_test_dst_l, nn_test_ts_l, nn_test_label_l)
+# nn_test_data.destinations, nn_test_data.timestamps, nn_test_data.labels)
 
 logger.info('Test MAE: {:.4f}'.format(test_mae))
 if args.scale_label != 'none':

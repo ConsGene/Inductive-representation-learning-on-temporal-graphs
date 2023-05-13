@@ -7,7 +7,6 @@ import sys
 import argparse
 
 import torch
-import pandas as pd
 import numpy as np
 #import numba
 from tqdm import tqdm
@@ -20,6 +19,7 @@ from data_utils import get_data
 from module import TGAN
 from graph import NeighborFinder
 from utils import EarlyStopMonitor, RandEdgeSampler
+import os
 
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for TGAT experiments on link predictions')
@@ -67,9 +67,10 @@ NODE_DIM = args.node_dim
 TIME_DIM = args.time_dim
 SCALE = args.scale_label
 
-
-MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}-{epoch}.pth'
+MODEL_NAME = f'{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}'
+MODEL_SAVE_PATH = f'./saved_models/{MODEL_NAME}.pth'
+BEST_METRICS_PATH = f'./best_metrics/{args.data}-best-metrics.txt'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{MODEL_NAME}-{epoch}.pth'
 
 ### set up logger
 logging.basicConfig(level=logging.INFO)
@@ -92,7 +93,18 @@ else:
     device = torch.device('cpu')
 node_features, edge_features, full_data, train_data, val_data, test_data, scaleUtil = get_data(DATA, SCALE, device)
 
-def eval_one_epoch(hint, tgan, sampler, src, dst, ts, label, label_raw):
+# write a function to store the best metrics and the corresponding model checkpoint
+def store_checkpoint(epoch, tgan, optimizer):
+    latest_path  = get_checkpoint_path('latest')
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': tgan.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict()
+    }, latest_path)
+    logger.info('Checkpoint saved to {}'.format(latest_path))
+    return
+
+def eval_one_epoch(tgan, sampler, src, dst, ts, label, label_raw):
     val_mae_raw, val_mae, val_r2_raw, val_r2 = [], [], [], []
     with torch.no_grad():
         tgan = tgan.eval()
@@ -173,7 +185,7 @@ logger.info('num of training instances: {}'.format(num_instance))
 logger.info('num of batches per epoch: {}'.format(num_batch))
 idx_list = np.arange(num_instance)
 np.random.shuffle(idx_list) 
-
+best_model_path = None
 early_stopper = EarlyStopMonitor(higher_better=False)
 for epoch in range(NUM_EPOCH):
     # Training 
@@ -233,7 +245,7 @@ for epoch in range(NUM_EPOCH):
 
     # validation phase use all information
     tgan.ngh_finder = full_ngh_finder
-    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch('val for old nodes', tgan, val_rand_sampler, val_data.sources, 
+    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch(tgan, val_rand_sampler, val_data.sources, 
     val_data.destinations, val_data.timestamps, val_data.labels, val_data.raw_labels)
 
         
@@ -252,33 +264,54 @@ for epoch in range(NUM_EPOCH):
 
     if early_stopper.early_stop_check(val_mae):
         logger.info('No improvment over {} epochs, stop training'.format(early_stopper.max_round))
-        logger.info(f'Loading the best model at epoch {early_stopper.best_epoch}')
-        best_model_path = get_checkpoint_path(early_stopper.best_epoch)
-        tgan.load_state_dict(torch.load(best_model_path))
-        logger.info(f'Loaded the best model at epoch {early_stopper.best_epoch} for inference')
-        tgan.eval()
         break
     else:
-        torch.save(tgan.state_dict(), get_checkpoint_path(epoch))
+        if early_stopper.best_epoch == epoch:
+            logger.info('Best epoch {} is the same as current epoch {}, save the model'.format(early_stopper.best_epoch, epoch))
+            best_model_path = get_checkpoint_path(epoch)
+            torch.save(tgan.state_dict(), best_model_path)
+    store_checkpoint(epoch, tgan, optimizer)
 
-
+# Load best model for testing 
+logger.info(f'Loading the best model at epoch {early_stopper.best_epoch} for Testing')
+best_model_path = get_checkpoint_path(early_stopper.best_epoch)
+tgan.load_state_dict(torch.load(best_model_path))
+logger.info(f'Loaded the best model from {best_model_path} for Testing')
 # testing phase use all information
 tgan.ngh_finder = full_ngh_finder
-test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch('test for old nodes', tgan, test_rand_sampler, test_data.sources, 
+test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch(tgan, test_rand_sampler, test_data.sources, 
 test_data.destinations, test_data.timestamps, test_data.labels, test_data.raw_labels)
 
-# nn_test_acc, nn_test_ap, nn_test_f1, nn_test_auc = etestone_epoch('test for new nodes', tgan, nn_test_rand_sampler, nn_test_src_l, 
-# nn_test_data.destinations, nn_test_data.timestamps, nn_test_data.labels)
-
+logger.info('Test R2: {:.4f}'.format(test_r2))
 logger.info('Test MAE: {:.4f}'.format(test_mae))
 if args.scale_label != 'none':
     logger.info('Test raw R2: {:.4f}'.format(test_r2_raw))
     logger.info('Test raw MAE: {:.4f}'.format(test_mae_raw))
-# logger.info('Test statistics: New nodes -- acc: {}, auc: {}, ap: {}'.format(nn_test_acc, nn_test_auc, nn_test_ap))
 
-logger.info('Saving TGAN model')
-torch.save(tgan.state_dict(), MODEL_SAVE_PATH)
-logger.info('TGAN models saved')
+def store_best_metrics(mae_raw, mae, r2_raw, r2):
+    # check for the existence of the best metric file, if not, create a new file and store the best metrics
+    if os.path.exists(BEST_METRICS_PATH):
+        with open(BEST_METRICS_PATH, 'r') as f:
+            lines = f.readlines()
+            f.close()
+        line_split = lines[1].split('\t')
+        mae_raw_best = float(line_split[2])
+        if mae_raw_best < mae_raw:
+            logger.info(f'Existing raw MAE {mae_raw_best} in {BEST_METRICS_PATH} is better than new one {mae_raw}, not storing the new one')
+            return
+    with open(BEST_METRICS_PATH, 'w') as f:
+        f.write('model_path\tmae\tmae_raw\tr2\tr2_raw\n')
+        f.write('{}\t{}\t{}\t{}\t{}\n'.format(MODEL_SAVE_PATH, mae, mae_raw, r2, r2_raw))
+        f.close()
+    logger.info('Saving model')
+    torch.save(tgan.state_dict(), MODEL_SAVE_PATH)
+    logger.info('Model saved')
+
+store_best_metrics(test_mae_raw, test_mae, test_r2_raw, test_r2)
+    
+
+
+
 
  
 

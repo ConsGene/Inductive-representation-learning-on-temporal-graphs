@@ -12,7 +12,10 @@ class MergeLayer(torch.nn.Module):
         #self.layer_norm = torch.nn.LayerNorm(dim1 + dim2)
         self.fc1 = torch.nn.Linear(dim1 + dim2, dim3)
         self.fc2 = torch.nn.Linear(dim3, dim4)
-        self.act = torch.nn.LeakyReLU(negative_slope=0.2)
+        if (activation == 'leakyRelu'):
+            self.act = torch.nn.LeakyReLU(negative_slope=0.2)
+        elif (activation == 'softmax'):
+            self.act = torch.nn.Softmax(dim=-1)
 
         torch.nn.init.xavier_normal_(self.fc1.weight)
         torch.nn.init.xavier_normal_(self.fc2.weight)
@@ -382,11 +385,13 @@ class AttnModel(torch.nn.Module):
 
 class TGAN(torch.nn.Module):
     def __init__(self, ngh_finder, n_feat, e_feat,
-                 attn_mode='prod', use_time='time', agg_method='attn', node_dim=None, time_dim=None,
-                 num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None):
+                 classification_model=False, attn_mode='prod', use_time='time', agg_method='attn', node_dim=None, time_dim=None,
+                 num_layers=3, num_classes=10, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None):
         super(TGAN, self).__init__()
-        
-        self.num_layers = num_layers 
+
+        self.classification_model = classification_model
+
+        self.num_layers = num_layers
         self.ngh_finder = ngh_finder
         self.null_idx = null_idx
         self.logger = logging.getLogger(__name__)
@@ -396,7 +401,9 @@ class TGAN(torch.nn.Module):
         self.node_raw_embed = torch.nn.Embedding.from_pretrained(self.n_feat_th, padding_idx=0, freeze=True)
         
         self.feat_dim = self.n_feat_th.shape[1]
-        
+
+        self.num_classes = num_classes
+
         self.n_feat_dim = self.feat_dim
         self.e_feat_dim = self.feat_dim
         self.model_dim = self.feat_dim
@@ -439,9 +446,13 @@ class TGAN(torch.nn.Module):
             self.time_encoder = EmptyEncode(expand_dim=self.n_feat_th.shape[1])
         else:
             raise ValueError('invalid time option!')
-        
-        self.affinity_score = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, 1) #torch.nn.Bilinear(self.feat_dim, self.feat_dim, 1, bias=True)
-        
+
+        # torch.nn.Bilinear(self.feat_dim, self.feat_dim, 1, bias=True)
+        self.affinity_score = MergeLayer(
+            self.feat_dim, self.feat_dim, self.feat_dim, 1)
+        self.classification_score = MergeLayer(
+            self.feat_dim, self.feat_dim, self.feat_dim, num_classes, activation='softmax')
+
     def forward(self, src_idx_l, target_idx_l, cut_time_l, num_neighbors=20):
         
         src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
@@ -453,11 +464,20 @@ class TGAN(torch.nn.Module):
         return score
     # change the activation function here when the label range is changed
     def contrast(self, src_idx_l, target_idx_l, background_idx_l, cut_time_l, num_neighbors=20):
-        src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        target_embed = self.tem_conv(target_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        background_embed = self.tem_conv(background_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        pos_score = self.affinity_score(src_embed, target_embed).squeeze(dim=-1)
-        neg_score = self.affinity_score(src_embed, background_embed).squeeze(dim=-1)
+        src_embed = self.tem_conv(
+            src_idx_l, cut_time_l, self.num_layers, num_neighbors)
+        target_embed = self.tem_conv(
+            target_idx_l, cut_time_l, self.num_layers, num_neighbors)
+        background_embed = self.tem_conv(
+            background_idx_l, cut_time_l, self.num_layers, num_neighbors)
+        if self.classification_model == False:
+            pos_score = self.affinity_score(
+                src_embed, target_embed).squeeze(dim=-1)
+            neg_score = self.affinity_score(
+                src_embed, background_embed).squeeze(dim=-1)
+        else:
+            pos_score = self.classification_score(src_embed, target_embed)
+            neg_score = self.classification_score(src_embed, background_embed)
         # return pos_score.tanh(), neg_score.tanh()
         return pos_score, neg_score # the activation of affinity_score is already LeakyReLU
 

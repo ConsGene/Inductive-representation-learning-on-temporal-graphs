@@ -167,20 +167,15 @@ class ScaleUtil:
 
         else:
             for cat in self.i2cat.values():
-                cat_train_df = train_df[train_df.cat == cat]
+                cat_train_df = train_df[train_df.cat==cat]
                 self.scalers_dict[cat] = self.scaler()
-                train_label_vals = self.prepare_transform(
-                    cat_train_df.label.values)
+                train_label_vals = self.prepare_transform(cat_train_df.label.values)
                 self.scalers_dict[cat].fit(train_label_vals.reshape(-1, 1))
-                label_vals = self.prepare_transform(
-                    graph_df.loc[graph_df.cat == cat]['label'].values)
-                label_vals_list = label_vals.tolist()  # Convert numpy array to a list
-                graph_df.loc[graph_df.cat == cat, 'label'] = self.scalers_dict[cat].transform(
-                    np.array(label_vals_list).reshape(-1, 1))
+                label_vals = self.prepare_transform(graph_df.loc[graph_df.cat == cat]['label'].values)
+                graph_df.loc[graph_df.cat == cat, 'label'] = self.scalers_dict[cat].transform(label_vals.reshape(-1, 1))
 
-                label_l = graph_df.label.values
-                raw_label_l = graph_df.raw_label.values
-
+        label_l = graph_df.label.values
+        raw_label_l = graph_df.raw_label.values
         return label_l, raw_label_l
 
     def prepare_transform(self, label_vals):

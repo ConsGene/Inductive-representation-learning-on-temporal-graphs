@@ -25,22 +25,40 @@ import os
 parser = argparse.ArgumentParser('Interface for TGAT experiments on link predictions')
 parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='u2k_i200_1W')
 parser.add_argument('--bs', type=int, default=200, help='batch_size')
-parser.add_argument('--prefix', type=str, default='', help='prefix to name the checkpoints')
-parser.add_argument('--loss', type=str, choices=['l1', 'l2'], default='l1', help='type of loss')
-parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
-parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
+parser.add_argument('--prefix', type=str, default='',
+                    help='prefix to name the checkpoints')
+parser.add_argument('--loss', type=str,
+                    choices=['l1', 'l2', 'cross_entropy'], default='cross_entropy', help='type of loss')
+parser.add_argument('--n_degree', type=int, default=20,
+                    help='number of neighbors to sample')
+parser.add_argument('--n_head', type=int, default=2,
+                    help='number of heads used in attention layer')
 parser.add_argument('--n_epoch', type=int, default=50, help='number of epochs')
-parser.add_argument('--n_layer', type=int, default=2, help='number of network layers')
+parser.add_argument('--n_layer', type=int, default=2,
+                    help='number of network layers')
+
+parser.add_argument('--n_classes', type=int, default=10,
+                    help='number of classes')
+
 parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
-parser.add_argument('--drop_out', type=float, default=0.1, help='dropout probability')
-parser.add_argument('--gpu', type=int, default=0, help='idx for the gpu to use')
-parser.add_argument('--node_dim', type=int, default=100, help='Dimentions of the node embedding')
-parser.add_argument('--time_dim', type=int, default=100, help='Dimentions of the time embedding')
-parser.add_argument('--agg_method', type=str, choices=['attn', 'lstm', 'mean'], help='local aggregation method', default='attn')
-parser.add_argument('--attn_mode', type=str, choices=['prod', 'map'], default='prod', help='use dot product attention or mapping based')
-parser.add_argument('--time', type=str, choices=['time', 'pos', 'empty'], help='how to use time information', default='time')
-parser.add_argument('--uniform', action='store_true', help='take uniform sampling from temporal neighbors')
-parser.add_argument('--scale_label', type=str, choices=['none', 'MinMax', 'Log', 'Cbrt', 'Quantile'], default='Cbrt', help='how to scale the label')
+parser.add_argument('--drop_out', type=float, default=0.1,
+                    help='dropout probability')
+parser.add_argument('--gpu', type=int, default=0,
+                    help='idx for the gpu to use')
+parser.add_argument('--node_dim', type=int, default=100,
+                    help='Dimentions of the node embedding')
+parser.add_argument('--time_dim', type=int, default=100,
+                    help='Dimentions of the time embedding')
+parser.add_argument('--agg_method', type=str, choices=[
+    'attn', 'lstm', 'mean'], help='local aggregation method', default='attn')
+parser.add_argument('--attn_mode', type=str, choices=[
+    'prod', 'map'], default='prod', help='use dot product attention or mapping based')
+parser.add_argument('--time', type=str, choices=[
+    'time', 'pos', 'empty'], help='how to use time information', default='time')
+parser.add_argument('--uniform', action='store_true',
+                    help='take uniform sampling from temporal neighbors')
+parser.add_argument('--scale_label', type=str, choices=[
+    'none', 'MinMax', 'Log', 'Cbrt', 'Quantile', 'Discr'], default='Discr', help='how to scale the label')
 
 try:
     args = parser.parse_args()
@@ -62,6 +80,7 @@ ATTN_MODE = args.attn_mode
 SEQ_LEN = NUM_NEIGHBORS
 DATA = args.data
 NUM_LAYER = args.n_layer
+NUM_CLASSES = args.n_classes
 LEARNING_RATE = args.lr
 NODE_DIM = args.node_dim
 TIME_DIM = args.time_dim
@@ -91,7 +110,12 @@ if GPU >= 0:
     device = torch.device('cuda:{}'.format(GPU))
 else:
     device = torch.device('cpu')
-node_features, edge_features, full_data, train_data, val_data, test_data, scaleUtil = get_data(DATA, SCALE, device)
+
+
+# device = torch.device('cpu')
+node_features, edge_features, full_data, train_data, val_data, test_data, scaleUtil = get_data(
+    DATA, SCALE, device, NUM_CLASSES)
+
 
 # write a function to store the best metrics and the corresponding model checkpoint
 def store_checkpoint(epoch, tgan, optimizer):
@@ -121,17 +145,33 @@ def eval_one_epoch(tgan, sampler, src, dst, ts, label, label_raw):
             dst_l_cut = dst[s_idx:e_idx]
             ts_l_cut = ts[s_idx:e_idx]
             # label_l_cut = label[s_idx:e_idx]
-            
+
             size = len(src_l_cut)
             _, dst_l_fake = sampler.sample(size)
             pos_label = label[s_idx:e_idx]
             pos_label_raw = label_raw[s_idx:e_idx]
-            neg_label = np.zeros(size)
-            pos_pred, neg_pred = tgan.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
-            
-            pred_score = np.concatenate([(pos_pred).cpu().numpy(), (neg_pred).cpu().numpy()])
-            # pred_label = pred_score > 0.5
-            true_label = np.concatenate([pos_label, neg_label])
+            neg_label = np.zeros(size, NUM_CLASSES)
+            pos_pred, neg_pred = tgan.contrast(
+                src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
+
+            if scaleUtil.scale_label == 'Discr':
+                pred_score_discrete = np.concatenate(
+                    [(pos_pred).cpu().detach().numpy(), (neg_pred).cpu().detach().numpy()])
+                pred_class = np.argmax(pred_score_discrete, axis=1)
+                pred_score = scaleUtil.convert_to_raw_label_scale(
+                    np.concatenate([dst_l_cut, dst_l_fake]), pred_class)
+
+                true_discrete_labels = np.concatenate(
+                    [pos_label, np.zeros((size, NUM_CLASSES))])
+                true_labels_class = np.argmax(true_discrete_labels, axis=1)
+                true_label = scaleUtil.convert_to_raw_label_scale(
+                    np.concatenate([dst_l_cut, dst_l_fake]), true_labels_class)
+
+            else:
+                pred_score = np.concatenate(
+                    [(pos_pred).cpu().numpy(), (neg_pred).cpu().numpy()])
+                true_label = np.concatenate([pos_label, neg_label])
+
             true_label_raw = np.concatenate([pos_label_raw, neg_label])
             val_mae.append(mean_absolute_error(true_label, pred_score))
             val_r2.append(r2_score(true_label, pred_score))
@@ -169,11 +209,14 @@ test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations)
 
 ### Model initialize
 tgan = TGAN(train_ngh_finder, node_features, edge_features,
-            num_layers=NUM_LAYER, use_time=USE_TIME, agg_method=AGG_METHOD, attn_mode=ATTN_MODE,
+            num_layers=NUM_LAYER, num_classes=NUM_CLASSES, classification_model=True, use_time=USE_TIME, agg_method=AGG_METHOD,
+            attn_mode=ATTN_MODE,
             seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM)
 optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
 if args.loss == 'l1':
     criterion = torch.nn.L1Loss()
+elif args.loss == 'cross_entropy':
+    criterion = torch.nn.CrossEntropyLoss()
 else:
     criterion = torch.nn.MSELoss()
 tgan = tgan.to(device)
@@ -184,11 +227,11 @@ num_batch = math.ceil(num_instance / BATCH_SIZE)
 logger.info('num of training instances: {}'.format(num_instance))
 logger.info('num of batches per epoch: {}'.format(num_batch))
 idx_list = np.arange(num_instance)
-np.random.shuffle(idx_list) 
+np.random.shuffle(idx_list)
 best_model_path = None
 early_stopper = EarlyStopMonitor(higher_better=False)
 for epoch in range(NUM_EPOCH):
-    # Training 
+    # Training
     # training use only training graph
     tgan.ngh_finder = train_ngh_finder
     mae_raw, mae, r2_raw, r2, m_loss = [], [], [], [], []
@@ -207,11 +250,13 @@ for epoch in range(NUM_EPOCH):
         raw_label_l_cut = train_data.raw_labels[s_idx:e_idx]
         size = len(src_l_cut)
         _, dst_l_fake = train_rand_sampler.sample(size)
-        
+
         with torch.no_grad():
-            pos_label = torch.tensor(label_l_cut, dtype=torch.float, device=device)
-            neg_label = torch.zeros(size, dtype=torch.float, device=device)
-        
+            pos_label = torch.tensor(
+                label_l_cut, dtype=torch.float, device=device)
+            neg_label = torch.zeros(
+                (size, NUM_CLASSES), dtype=torch.float, device=device)
+
         optimizer.zero_grad()
         tgan = tgan.train()
         pos_pred, neg_pred = tgan.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
@@ -223,17 +268,34 @@ for epoch in range(NUM_EPOCH):
         #     neg_pred_raw, neg_label_raw = convert_to_raw_label_scale(dst_l_fake, neg_pred, neg_label)
         #     loss = criterion(pos_pred_raw, pos_label_raw)
         #     loss += criterion(neg_pred_raw, neg_label_raw)
-        
+
         loss.backward()
         optimizer.step()
         # get training results
         with torch.no_grad():
             tgan = tgan.eval()
-            pred_score = np.concatenate([(pos_pred).cpu().detach().numpy(), (neg_pred).cpu().detach().numpy()])
-            true_label = np.concatenate([label_l_cut, np.zeros(size)])
-            true_label_raw = np.concatenate([raw_label_l_cut, np.zeros(size)])
-            
-            mae.append(mean_absolute_error(true_label, pred_score))
+            if scaleUtil.scale_label == 'Discr':
+                pred_score_discrete = np.concatenate(
+                    [(pos_pred).cpu().detach().numpy(), (neg_pred).cpu().detach().numpy()])
+                pred_class = np.argmax(pred_score_discrete, axis=1)
+                pred_score = scaleUtil.convert_to_raw_label_scale(
+                    np.concatenate([dst_l_cut, dst_l_fake]), pred_class)
+
+                true_discrete_labels = np.concatenate(
+                    [pos_label, np.zeros((size, NUM_CLASSES))])
+                true_labels_class = np.argmax(true_discrete_labels, axis=1)
+                true_label = scaleUtil.convert_to_raw_label_scale(
+                    np.concatenate([dst_l_cut, dst_l_fake]), true_labels_class)
+
+            else:
+                pred_score = np.concatenate(
+                    [(pos_pred).cpu().numpy(), (neg_pred).cpu().numpy()])
+                true_label = np.concatenate([pos_label, neg_label])
+
+                true_label_raw = np.concatenate(
+                    [raw_label_l_cut, np.zeros(size)])
+
+                mae.append(mean_absolute_error(true_label, pred_score))
 
             # f1.append(f1_score(true_label, pred_label))
             m_loss.append(loss.item())
@@ -245,10 +307,10 @@ for epoch in range(NUM_EPOCH):
 
     # validation phase use all information
     tgan.ngh_finder = full_ngh_finder
-    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch(tgan, val_rand_sampler, val_data.sources, 
+    val_mae_raw, val_mae, val_r2_raw, val_r2 = eval_one_epoch(tgan, val_rand_sampler, val_data.sources,
     val_data.destinations, val_data.timestamps, val_data.labels, val_data.raw_labels)
 
-        
+
     logger.info('epoch: {}:'.format(epoch))
     logger.info('Epoch mean loss: {:.4f}'.format(np.mean(m_loss)))
     # logger.info('train acc: {}, val acc: {}, new node val acc: {}'.format(np.mean(acc), val_acc, nn_val_acc))
@@ -272,14 +334,14 @@ for epoch in range(NUM_EPOCH):
             torch.save(tgan.state_dict(), best_model_path)
     store_checkpoint(epoch, tgan, optimizer)
 
-# Load best model for testing 
+# Load best model for testing
 logger.info(f'Loading the best model at epoch {early_stopper.best_epoch} for Testing')
 best_model_path = get_checkpoint_path(early_stopper.best_epoch)
 tgan.load_state_dict(torch.load(best_model_path))
 logger.info(f'Loaded the best model from {best_model_path} for Testing')
 # testing phase use all information
 tgan.ngh_finder = full_ngh_finder
-test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch(tgan, test_rand_sampler, test_data.sources, 
+test_mae_raw, test_mae, test_r2_raw, test_r2 = eval_one_epoch(tgan, test_rand_sampler, test_data.sources,
 test_data.destinations, test_data.timestamps, test_data.labels, test_data.raw_labels)
 
 logger.info('Test R2: {:.4f}'.format(test_r2))
@@ -308,12 +370,12 @@ def store_best_metrics(mae_raw, mae, r2_raw, r2):
     logger.info('Model saved')
 
 store_best_metrics(test_mae_raw, test_mae, test_r2_raw, test_r2)
-    
 
 
 
 
- 
+
+
 
 
 

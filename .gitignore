@@ -4,6 +4,7 @@
 
 # Custom
 tmp/
+tmp*
 log/
 results/
 saved_checkpoints/

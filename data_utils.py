@@ -23,7 +23,7 @@ class Data:
     self.raw_labels = raw_labels
     self.labels = labels
 
-class KBinsDiscretizer:
+class KBinsScaler:
     def __init__(self, n_bins, strategy="agg"):
         self.n_bins = n_bins
         self.strategy = strategy
@@ -39,14 +39,7 @@ class KBinsDiscretizer:
             else:
                 clustering_model = AgglomerativeClustering(n_clusters=n_clusters, linkage='average')
             clustering_model.fit(X.reshape(-1, 1))
-            cluster_labels, bin_edges_ = zip(*sorted(zip(clustering_model.labels_, clustering_model.cluster_centers_.flatten()), key=lambda x: x[1]))
-            # ensure the first bin is always 0
-            self.bin_edges_ = np.concatenate(([0], bin_edges_))
-            # save the standard deviation of each cluster into self.std
-            self.std_ = np.zeros(self.n_bins)
-            for i in range(n_clusters):
-                self.std_[i+1] = np.std(X[cluster_labels == i])
-            
+            self.bin_edges_  = np.sort(np.append(clustering_model.cluster_centers_.flatten(), 0))
         else:    
             self.bin_edges_ = np.percentile(X, np.linspace(0, 100, self.n_bins - 1))
         return self
@@ -61,21 +54,32 @@ class KBinsDiscretizer:
                 X_binned[i] = np.argmin(np.abs(X[i] - self.bin_edges_))
         else:
             X_binned = np.digitize(X, self.bin_edges_, right=True)
-        # Create one-hot encoding
-        one_hot = np.zeros((len(X), self.n_bins))
-        one_hot[np.arange(len(X)), X_binned] = 1
-        return one_hot
+        return X_binned
 
     def fit_transform(self, X):
         return self.fit(X).transform(X)
 
     def inverse_transform(self, X):
-        return self.bin_edges_[np.argmax(X)]
+        return self.bin_edges_[np.clip(np.round(X), 0, len(self.bin_edges_)-1).astype(int)]
 
     def __repr__(self):
-        return "KBinsDiscretizer(n_bins={})".format(self.n_bins)
+        return "KBinsScaler(n_bins={}, strategy{})".format(self.n_bins, self.strategy)
 
-def get_data(dataset_name, scale_label, device, num_classes=10):
+class KBinsDiscretizer(KBinsScaler):
+    def transform(self, X):
+        X_binned = super().transform(X)
+        # Create one-hot encoding
+        one_hot = np.zeros((len(X), self.n_bins))
+        one_hot[np.arange(len(X)), X_binned] = 1
+        return one_hot
+
+    def inverse_transform(self, X):
+        return self.bin_edges_[np.argmax(X)]
+    
+    def __repr__(self):
+        return "KBinsDiscretizer(n_bins={}, strategy{})".format(self.n_bins, self.strategy)
+
+def get_data(dataset_name, scale_label, device, num_classes=10, classification_mode=False):
     ### Load data and train val test split
     graph_df = pd.read_csv('./processed/ml_{}.csv'.format(dataset_name))
     edge_features = np.load('./processed/ml_{}.npy'.format(dataset_name))
@@ -101,7 +105,7 @@ def get_data(dataset_name, scale_label, device, num_classes=10):
     cat_l = graph_df.cat.values
     e_idx_l = graph_df.idx.values
     # scaling labels
-    scaleUtil = ScaleUtil(scale_label, device, num_classes=num_classes)
+    scaleUtil = ScaleUtil(scale_label, device, num_classes=num_classes, classification_mode=classification_mode)
     label_l, raw_label_l = scaleUtil.transform_df(graph_df, valid_train_flag)
 
     full_data = Data(sources=src_l, 
@@ -133,7 +137,7 @@ def get_data(dataset_name, scale_label, device, num_classes=10):
 
 
 class ScaleUtil:
-    def __init__(self, scale_label, device, num_classes=10):
+    def __init__(self, scale_label, device, num_classes, classification_mode):
         self.scale_label = scale_label
         if scale_label == 'MinMax':
             self.sscaler = preprocessing.MinMaxScaler
@@ -144,12 +148,15 @@ class ScaleUtil:
         elif scale_label == 'Cbrt':
             self.scaler = preprocessing.StandardScaler
         elif scale_label.startswith('Discr'):
-            self.scaler = KBinsDiscretizer
             self.num_classes = num_classes
-
+            if classification_mode:
+                self.scaler = KBinsDiscretizer
+            else:
+                self.scaler = KBinsScaler
         self.device = device
         self.i2cat = None
         self.scalers_dict = None
+        self.classification_mode = classification_mode
     
     def transform_df(self, original_graph_df, valid_train_flag):
         graph_df = original_graph_df.copy()
@@ -171,18 +178,12 @@ class ScaleUtil:
             graph_df.label = np.cbrt(graph_df.label.values)
         else:
             graph_df['label'] = self.prepare_transform(graph_df.label.values)
-            if self.scale_label.startswith('Discr'):
+            if self.classification_mode:
                  scaled_label_cols=[f'label_{i}' for i in range(self.num_classes)]
                  graph_df[scaled_label_cols] = np.zeros(shape=(graph_df.shape[0],self.num_classes))
             train_df = graph_df[valid_train_flag]
             self.scalers_dict = {}
-            if self.scale_label.endswith('#all'):
-                train_label_vals = train_df.label.values
-                self.scalers_dict['#all'] = self.scaler(n_bins=self.num_classes, strategy=self.scale_label.split('-')[1])
-                self.scalers_dict['#all'].fit(train_label_vals.reshape(-1, 1))
-                label_vals = graph_df.label.values      
-                graph_df[scaled_label_cols] = self.scalers_dict['#all'].transform(label_vals.reshape(-1, 1))
-            else:
+            if self.scale_label.endswith('#cat'):
                 for cat in set(self.i2cat.values()):
                     if self.scale_label.startswith('Discr'):
                         self.scalers_dict[cat] = self.scaler(n_bins=self.num_classes, strategy=self.scale_label.split('-')[1])
@@ -192,6 +193,15 @@ class ScaleUtil:
                     self.scalers_dict[cat].fit(train_label_vals.reshape(-1, 1))
                     label_vals = graph_df.loc[graph_df.cat == cat].label.values      
                     graph_df.loc[graph_df.cat == cat, scaled_label_cols] = self.scalers_dict[cat].transform(label_vals.reshape(-1, 1))
+            else:
+                train_label_vals = train_df.label.values
+                if self.scale_label.startswith('Discr'):
+                    self.scalers_dict['#all'] = self.scaler(n_bins=self.num_classes, strategy=self.scale_label.split('-')[1])
+                else:
+                    self.scalers_dict['#all'] = self.scaler()
+                self.scalers_dict['#all'].fit(train_label_vals.reshape(-1, 1))
+                label_vals = graph_df.label.values      
+                graph_df[scaled_label_cols] = self.scalers_dict['#all'].transform(label_vals.reshape(-1, 1))
         return graph_df[scaled_label_cols].values, graph_df.raw_label.values
         
     def prepare_transform(self, label_vals):
@@ -202,18 +212,19 @@ class ScaleUtil:
         return label_vals
 
     def convert_to_raw_label_scale(self, dst_l_cut, preds):
-        if (self.i2cat is None) or (self.scalers_dict is None):
-            raise RuntimeError("self.i2cat or self.scalers_dict is None. Run ScaleUtil.transform_df function first")
         raw_preds = []
         for dst, pred in zip(dst_l_cut, preds):
             if self.scale_label == 'Cbrt':
                 raw = np.power(pred, 3)
                 raw_preds.append(raw)
             else:
-                if self.scale_label.endswith('#all'):
-                    cat = '#all'
-                else:
+                if (self.i2cat is None) or (self.scalers_dict is None):
+                    raise RuntimeError("self.i2cat or self.scalers_dict is None. Run ScaleUtil.transform_df function first")
+                if self.scale_label.endswith('#cat'):
+                    
                     cat = self.i2cat[dst]
+                else:
+                    cat = '#all'
                 raw = self.scalers_dict[cat].inverse_transform(pred.reshape(1, -1))
                 if self.scale_label == 'Log':
                     raw = np.sign(raw) * (np.exp(np.abs(raw))-1)

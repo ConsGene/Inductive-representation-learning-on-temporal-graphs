@@ -24,7 +24,7 @@ parser = argparse.ArgumentParser('Interface for TGAT experiments on link predict
 parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='u2k_i200_1W')
 parser.add_argument('--bs', type=int, default=200, help='batch_size')
 parser.add_argument('--prefix', type=str, default='', help='prefix to name the checkpoints')
-parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'cross_entropy'], default='cross_entropy', help='type of loss')
+parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'cross_entropy'], default='l1', help='type of loss')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
 parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
 parser.add_argument('--n_epoch', type=int, default=50, help='number of epochs')
@@ -67,6 +67,7 @@ LEARNING_RATE = args.lr
 NODE_DIM = args.node_dim
 TIME_DIM = args.time_dim
 SCALE = args.scale_label
+CLASSIFICATION = args.loss == 'cross_entropy'
 
 MODEL_NAME = f'{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}'
 MODEL_SAVE_PATH = f'./saved_models/{MODEL_NAME}.pth'
@@ -95,7 +96,7 @@ else:
 
 
 node_features, edge_features, full_data, train_data, val_data, test_data, scaleUtil = get_data(
-    DATA, SCALE, device, NUM_CLASSES)
+    DATA, SCALE, device, NUM_CLASSES, CLASSIFICATION)
 
 
 # write a function to store the best metrics and the corresponding model checkpoint
@@ -110,7 +111,7 @@ def store_checkpoint(epoch, tgan, optimizer):
     return
 
 def get_neg_labels(size):
-    if SCALE.startswith('Discr'):
+    if CLASSIFICATION:
         # the first class is the 0 class
         return np.concatenate([np.ones((size, 1)), np.zeros((size, NUM_CLASSES-1))], axis=1)
     else:
@@ -173,8 +174,9 @@ test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations)
 
 
 ### Model initialize
+
 tgan = TGAN(train_ngh_finder, node_features, edge_features,
-            num_layers=NUM_LAYER, num_classes=NUM_CLASSES, classification_model=True, use_time=USE_TIME, agg_method=AGG_METHOD,
+            num_layers=NUM_LAYER, num_classes=NUM_CLASSES, classification_mode=CLASSIFICATION, use_time=USE_TIME, agg_method=AGG_METHOD,
             attn_mode=ATTN_MODE,
             seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM)
 optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
